@@ -1,89 +1,17 @@
 import discord
 from discord.ext import commands
-import aiohttp
+import requests
 import os
 from flask import Flask
 from threading import Thread
 
-# ----- Discord Bot Setup -----
-
 intents = discord.Intents.default()
-intents.message_content = True  # Needed to read message content
+intents.message_content = True
+intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-GOOGLE_BOOKS_API_KEY = os.getenv('GOOGLE_BOOKS_API_KEY')
-
-# Helper function to search Google Books API
-async def search_book(title):
-    url = f"https://www.googleapis.com/books/v1/volumes?q={title}&key={GOOGLE_BOOKS_API_KEY}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data["totalItems"] == 0:
-                    return None
-                book = data["items"][0]["volumeInfo"]
-                return {
-                    "title": book.get("title", "No title"),
-                    "authors": ", ".join(book.get("authors", ["Unknown author"])),
-                    "description": book.get("description", "No description available."),
-                    "pageCount": book.get("pageCount", "Unknown"),
-                    "averageRating": book.get("averageRating", "No rating"),
-                    "thumbnail": book.get("imageLinks", {}).get("thumbnail", "")
-                }
-            else:
-                return None
-
-# Command: !review <book title>
-@bot.command(name='review')
-async def review(ctx, *, book_title):
-    book = await search_book(book_title)
-    if not book:
-        await ctx.send("Sorry, I couldn't find that book.")
-        return
-    
-    embed = discord.Embed(title=book["title"], description=book["description"][:500] + "...", color=0x00ff00)
-    embed.set_thumbnail(url=book["thumbnail"])
-    embed.add_field(name="Authors", value=book["authors"], inline=True)
-    embed.add_field(name="Pages", value=book["pageCount"], inline=True)
-    embed.add_field(name="Average Rating", value=str(book["averageRating"]), inline=True)
-    await ctx.send(embed=embed)
-    await ctx.send("Please rate this book from 1 to 5 by typing the number (you have 30 seconds).")
-
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit() and 1 <= int(m.content) <= 5
-    
-    try:
-        msg = await bot.wait_for('message', timeout=30.0, check=check)
-        rating = int(msg.content)
-        await ctx.send(f"Thanks for rating **{book['title']}** with a score of {rating}/5!")
-        # Here you could store the rating somewhere (database or file)
-    except:
-        await ctx.send("No rating received. You can rate later if you want!")
-
-# Command: !currentlyreading
-currently_reading = {}
-
-@bot.command(name='currentlyreading')
-async def currently_reading_command(ctx, *, book_title=None):
-    if book_title:
-        currently_reading[ctx.author.id] = book_title
-        await ctx.send(f"{ctx.author.display_name} is now reading **{book_title}**.")
-    else:
-        book = currently_reading.get(ctx.author.id)
-        if book:
-            await ctx.send(f"{ctx.author.display_name} is currently reading **{book}**.")
-        else:
-            await ctx.send("You haven't set a book you're currently reading. Use `!currentlyreading <book title>` to set one.")
-
-# Ready event
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}!")
-
-# ----- Flask Web Server to keep Replit awake -----
-
+# Keep-alive server (for Replit)
 app = Flask('')
 
 @app.route('/')
@@ -93,12 +21,120 @@ def home():
 def run():
     app.run(host='0.0.0.0', port=8080)
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+Thread(target=run).start()
 
-keep_alive()
+# In-memory databases
+reviews = {}
+currently_reading = {}
 
-# ----- Run Discord Bot -----
+GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+# COMMAND: !review <book name>
+@bot.command(name='review')
+async def review_book(ctx, *, book_title):
+    search_url = f"https://www.googleapis.com/books/v1/volumes?q={book_title}&key={GOOGLE_BOOKS_API_KEY}"
+    response = requests.get(search_url)
+    data = response.json()
+
+    if "items" not in data or len(data["items"]) == 0:
+        await ctx.send("❌ Book not found.")
+        return
+
+    book = data["items"][0]["volumeInfo"]
+    title = book.get("title", "Unknown Title")
+    authors = ", ".join(book.get("authors", ["Unknown Author"]))
+    description = book.get("description", "No description available.")
+
+    await ctx.send(f"**{title}** by {authors}\n\n{description}\n\nPlease rate this book (1-5) and leave a review with `!rate \"{title}\" <1-5> <your review>`")
+
+# COMMAND: !rate "<book title>" <1-5> <review>
+@bot.command(name='rate')
+async def rate_book(ctx, title: str, rating: int, *, user_review):
+    user_id = str(ctx.author.id)
+
+    if title not in reviews:
+        reviews[title] = []
+
+    reviews[title].append({
+        "user": ctx.author.display_name,
+        "rating": rating,
+        "review": user_review
+    })
+
+    await ctx.send(f"✅ Thanks, {ctx.author.display_name}! Your review for **{title}** has been recorded.")
+
+# COMMAND: !reviews <book title>
+@bot.command(name='reviews')
+async def show_reviews(ctx, *, title):
+    if title not in reviews or not reviews[title]:
+        await ctx.send("📭 No reviews yet for this book.")
+        return
+
+    msg = f"📚 Reviews for **{title}**:\n\n"
+    for entry in reviews[title]:
+        msg += f"⭐ {entry['rating']}/5 by {entry['user']}: {entry['review']}\n\n"
+
+    await ctx.send(msg)
+
+# COMMAND: !currentlyreading [<book title> | <username>]
+@bot.command(name='currentlyreading')
+async def currently_reading_command(ctx, *, arg=None):
+    user_id = str(ctx.author.id)
+
+    if arg is None:
+        # No argument – show user's current book
+        if user_id in currently_reading:
+            await ctx.send(f"📖 You are currently reading: **{currently_reading[user_id]}**")
+        else:
+            await ctx.send("❌ You are not currently reading any book.")
+        return
+
+    # Try to find a user by mention or name
+    mentioned_user = None
+    if ctx.message.mentions:
+        mentioned_user = ctx.message.mentions[0]
+    else:
+        for member in ctx.guild.members:
+            if member.name.lower() == arg.lower() or member.display_name.lower() == arg.lower():
+                mentioned_user = member
+                break
+
+    if mentioned_user:
+        target_id = str(mentioned_user.id)
+        if target_id in currently_reading:
+            await ctx.send(f"📖 {mentioned_user.display_name} is currently reading: **{currently_reading[target_id]}**")
+        else:
+            await ctx.send(f"❌ {mentioned_user.display_name} is not currently reading any book.")
+    else:
+        # No matching user – assume it's a book title
+        currently_reading[user_id] = arg
+        await ctx.send(f"✅ Got it! You're now marked as reading: **{arg}**")
+
+# COMMAND: !clearreading
+@bot.command(name='clearreading')
+async def clear_reading(ctx):
+    user_id = str(ctx.author.id)
+    if user_id in currently_reading:
+        del currently_reading[user_id]
+        await ctx.send("🗑️ Your currently reading book has been cleared.")
+    else:
+        await ctx.send("❌ You don't have a currently reading book to clear.")
+
+# COMMAND: !help (overriding default)
+@bot.command(name='help')
+async def help_command(ctx):
+    help_text = """
+📚 **BearCrabs Book Bot Commands**
+
+`!review <book title>` – Search for a book and start a review  
+`!rate "<book title>" <1-5> <review>` – Submit a review  
+`!reviews <book title>` – Show all reviews for a book  
+`!currentlyreading` – Show your current book  
+`!currentlyreading <book title>` – Set your current book  
+`!currentlyreading <username>` – See someone else's book  
+`!clearreading` – Clear your currently reading status  
+"""
+    await ctx.send(help_text)
+
+# Run the bot
+bot.run(os.getenv("DISCORD_TOKEN"))
