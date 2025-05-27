@@ -1,8 +1,8 @@
-
 import discord
 from discord.ext import commands
 import requests
 from flask import Flask
+import urllib.parse  # Added for URL encoding
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -16,25 +16,35 @@ app = Flask(__name__)
 currently_reading = {}
 
 # Google Books API key
-GOOGLE_API_KEY = "YOUR_GOOGLE_BOOKS_API_KEY"
+GOOGLE_API_KEY = "AIzaSyD-KJqlmwVbpbJlv9bFWywOMtgxbmoW5Pc"
 
 # Helper function to search Google Books
 def search_google_books(query):
-    url = f"https://www.googleapis.com/books/v1/volumes?q={query}&key={GOOGLE_API_KEY}"
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://www.googleapis.com/books/v1/volumes?q={encoded_query}&key={GOOGLE_API_KEY}"
+    print(f"DEBUG: Google Books API URL: {url}")
     response = requests.get(url)
+    print(f"DEBUG: Google Books API Response Status: {response.status_code}")
     if response.status_code != 200:
+        print(f"ERROR: API request failed with status {response.status_code}")
+        print(f"Response content: {response.text}")
         return None
     data = response.json()
     if "items" not in data or len(data["items"]) == 0:
+        print("DEBUG: No items found in API response.")
         return None
     book = data["items"][0]["volumeInfo"]
     title = book.get("title", "Unknown Title")
     authors = ", ".join(book.get("authors", ["Unknown Author"]))
     description = book.get("description", "No description available.")
+    thumbnail = book.get("imageLinks", {}).get("thumbnail")
+    info_link = book.get("infoLink", "")
     return {
         "title": title,
         "authors": authors,
-        "description": description
+        "description": description,
+        "thumbnail": thumbnail,
+        "info_link": info_link
     }
 
 # Commands
@@ -43,6 +53,7 @@ def search_google_books(query):
 async def currently_reading_command(ctx, *, arg=None):
     """Set or get currently reading book. If arg is empty, shows your current book.
        If arg is a username mention, shows their current book."""
+    print(f"DEBUG: !currentlyreading called with arg: {arg}")
     if arg is None:
         # Show user's own current book
         book = currently_reading.get(ctx.author.id)
@@ -60,9 +71,21 @@ async def currently_reading_command(ctx, *, arg=None):
             else:
                 await ctx.send(f"{user.display_name} has not set a currently reading book.")
         else:
-            # Set user's current book
-            currently_reading[ctx.author.id] = arg
-            await ctx.send(f"{ctx.author.display_name} is now reading: **{arg}**")
+            # Try to search Google Books for info and show a nice message with link
+            book_info = search_google_books(arg)
+            if book_info is None:
+                await ctx.send(f"Could not find the book '{arg}' in Google Books.")
+                return
+            currently_reading[ctx.author.id] = book_info['title']
+            embed = discord.Embed(
+                title=book_info['title'],
+                url=book_info['info_link'],
+                description=f"Author(s): {book_info['authors']}\n\n{book_info['description'][:300]}...",
+                color=discord.Color.blue()
+            )
+            if book_info['thumbnail']:
+                embed.set_thumbnail(url=book_info['thumbnail'])
+            await ctx.send(f"{ctx.author.display_name} is now reading:", embed=embed)
 
 @bot.command(name='clearreading')
 async def clear_reading_command(ctx):
