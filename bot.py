@@ -1,103 +1,88 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import aiohttp
 import os
+from flask import Flask
+from threading import Thread
 
-# Get tokens from environment variables for security
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-GOOGLE_BOOKS_API_KEY = os.getenv('GOOGLE_BOOKS_API_KEY')
+# ----- Discord Bot Setup -----
 
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # Needed to read message content
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# In-memory storage for user reviews and currently reading (you can later move to DB)
-user_reviews = {}
-currently_reading = {}
+GOOGLE_BOOKS_API_KEY = os.getenv('GOOGLE_BOOKS_API_KEY')
 
-# Helper to fetch book info from Google Books API
-async def fetch_book_info(book_title):
-    url = f'https://www.googleapis.com/books/v1/volumes?q={book_title}&key={GOOGLE_BOOKS_API_KEY}&maxResults=1'
+# Helper function to search Google Books API
+async def search_book(title):
+    url = f"https://www.googleapis.com/books/v1/volumes?q={title}&key={GOOGLE_BOOKS_API_KEY}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                data = await resp.json()
+                if data["totalItems"] == 0:
+                    return None
+                book = data["items"][0]["volumeInfo"]
+                return {
+                    "title": book.get("title", "No title"),
+                    "authors": ", ".join(book.get("authors", ["Unknown author"])),
+                    "description": book.get("description", "No description available."),
+                    "pageCount": book.get("pageCount", "Unknown"),
+                    "averageRating": book.get("averageRating", "No rating"),
+                    "thumbnail": book.get("imageLinks", {}).get("thumbnail", "")
+                }
+            else:
                 return None
-            data = await resp.json()
-            if 'items' not in data or len(data['items']) == 0:
-                return None
-            book = data['items'][0]['volumeInfo']
-            title = book.get('title', 'Unknown Title')
-            authors = ", ".join(book.get('authors', ['Unknown Author']))
-            description = book.get('description', 'No description available.')
-            return {
-                'title': title,
-                'authors': authors,
-                'description': description
-            }
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    print('------')
-
+# Command: !review <book title>
 @bot.command(name='review')
-async def review(ctx, rating: int, *, book_title):
-    """Leave a review and rating for a book."""
-    if rating < 1 or rating > 5:
-        await ctx.send("Please provide a rating between 1 and 5.")
+async def review(ctx, *, book_title):
+    book = await search_book(book_title)
+    if not book:
+        await ctx.send("Sorry, I couldn't find that book.")
         return
+    
+    embed = discord.Embed(title=book["title"], description=book["description"][:500] + "...", color=0x00ff00)
+    embed.set_thumbnail(url=book["thumbnail"])
+    embed.add_field(name="Authors", value=book["authors"], inline=True)
+    embed.add_field(name="Pages", value=book["pageCount"], inline=True)
+    embed.add_field(name="Average Rating", value=str(book["averageRating"]), inline=True)
+    await ctx.send(embed=embed)
+    await ctx.send("Please rate this book from 1 to 5 by typing the number (you have 30 seconds).")
 
-    info = await fetch_book_info(book_title)
-    if not info:
-        await ctx.send(f"Sorry, I couldn't find the book titled '{book_title}'.")
-        return
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit() and 1 <= int(m.content) <= 5
+    
+    try:
+        msg = await bot.wait_for('message', timeout=30.0, check=check)
+        rating = int(msg.content)
+        await ctx.send(f"Thanks for rating **{book['title']}** with a score of {rating}/5!")
+        # Here you could store the rating somewhere (database or file)
+    except:
+        await ctx.send("No rating received. You can rate later if you want!")
 
-    # Save review in-memory (replace with DB if you want persistent storage)
-    user_reviews[(ctx.author.id, info['title'])] = {
-        'rating': rating,
-        'review': f"{ctx.author.name}'s review on {info['title']}",
-    }
-
-    await ctx.send(f"Thanks for your review of **{info['title']}** by {info['authors']}! You gave it a {rating}/5.")
+# Command: !currentlyreading
+currently_reading = {}
 
 @bot.command(name='currentlyreading')
-async def currently_reading_cmd(ctx, *, book_title):
-    """Set what book you are currently reading."""
-    info = await fetch_book_info(book_title)
-    if not info:
-        await ctx.send(f"Couldn't find the book titled '{book_title}'.")
-        return
+async def currently_reading_command(ctx, *, book_title=None):
+    if book_title:
+        currently_reading[ctx.author.id] = book_title
+        await ctx.send(f"{ctx.author.display_name} is now reading **{book_title}**.")
+    else:
+        book = currently_reading.get(ctx.author.id)
+        if book:
+            await ctx.send(f"{ctx.author.display_name} is currently reading **{book}**.")
+        else:
+            await ctx.send("You haven't set a book you're currently reading. Use `!currentlyreading <book title>` to set one.")
 
-    currently_reading[ctx.author.id] = info['title']
-    await ctx.send(f"{ctx.author.name} is now reading **{info['title']}**.")
+# Ready event
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}!")
 
-@bot.command(name='showreading')
-async def show_reading(ctx, member: discord.Member = None):
-    """Show what book a user is currently reading."""
-    member = member or ctx.author
-    book = currently_reading.get(member.id, None)
-    if not book:
-        await ctx.send(f"{member.name} hasn't set a currently reading book.")
-        return
-    await ctx.send(f"{member.name} is currently reading **{book}**.")
-
-@bot.command(name='helpme')
-async def help_command(ctx):
-    help_text = """
-**BearCrabs Book Bot Commands:**
-`!review <rating 1-5> <book title>` - Leave a rating and review for a book.
-`!currentlyreading <book title>` - Set what you’re currently reading.
-`!showreading [@user]` - Show what book a user is reading. If no user mentioned, shows yours.
-`!helpme` - Show this help message.
-"""
-    await ctx.send(help_text)
-
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
-
-from flask import Flask
-from threading import Thread
+# ----- Flask Web Server to keep Replit awake -----
 
 app = Flask('')
 
@@ -113,3 +98,7 @@ def keep_alive():
     t.start()
 
 keep_alive()
+
+# ----- Run Discord Bot -----
+
+bot.run(os.getenv('DISCORD_TOKEN'))
