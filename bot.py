@@ -16,7 +16,7 @@ app = Flask(__name__)
 currently_reading = {}
 
 # Google Books API key
-GOOGLE_API_KEY = "AIzaSyD-KJqlmwVbpbJlv9bFWywOMtgxbmoW5Pc"
+GOOGLE_API_KEY = "Google API Key"
 
 # Helper function to search Google Books
 def search_google_books(query):
