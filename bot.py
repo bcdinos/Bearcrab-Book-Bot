@@ -1,19 +1,17 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import requests
 import os
-import asyncio
-from flask import Flask
-from threading import Thread
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix='!', intents=intents)
+tree = bot.tree
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-
 currently_reading = {}
-reviews = {}  # user_id -> list of reviews
+reviews = {}
 
 def search_google_books(query, max_results=3):
     url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={max_results}&key={GOOGLE_API_KEY}"
@@ -35,246 +33,214 @@ def search_google_books(query, max_results=3):
         })
     return books
 
-async def prompt_for_choice(ctx, prompt_message, num_choices):
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel
-    try:
-        while True:
-            msg = await bot.wait_for('message', timeout=60.0, check=check)
-            content = msg.content.strip().lower()
-            if content == "cancel":
-                await ctx.send("Cancelled.")
-                return None
-            if content.isdigit():
-                choice = int(content)
-                if 1 <= choice <= num_choices:
-                    return choice - 1
-            await ctx.send(f"Please enter a number between 1 and {num_choices}, or type `cancel` to abort.")
-    except asyncio.TimeoutError:
-        await ctx.send("Timeout. Please try again.")
-        return None
+async def prompt_user_choice(interaction, books):
+    view = discord.ui.View(timeout=60)
+    options = []
+    for i, book in enumerate(books, 1):
+        label = f"{book['title']} by {book['authors']}"
+        options.append(discord.SelectOption(label=label[:100], value=str(i-1)))
 
-@bot.command(name='reading')
-async def reading_command(ctx, *, arg=None):
-    if arg is None:
-        book = currently_reading.get(ctx.author.id)
-        if book:
-            embed = discord.Embed(
-                title=book["title"],
-                url=book.get("infoLink"),
-                description=book["description"][:2048],
-                color=discord.Color.blue()
-            )
-            embed.set_author(name=book["authors"])
-            if book.get("thumbnail"):
-                embed.set_thumbnail(url=book["thumbnail"])
-            await ctx.send(f"{ctx.author.display_name} is currently reading:", embed=embed)
-        else:
-            await ctx.send("You have not set a currently reading book. Use `!reading [book name]` to set one.")
-    else:
-        if len(ctx.message.mentions) > 0:
-            user = ctx.message.mentions[0]
-            book = currently_reading.get(user.id)
-            if book:
-                embed = discord.Embed(
-                    title=book["title"],
-                    url=book.get("infoLink"),
-                    description=book["description"][:2048],
-                    color=discord.Color.green()
-                )
-                embed.set_author(name=book["authors"])
-                if book.get("thumbnail"):
-                    embed.set_thumbnail(url=book["thumbnail"])
-                await ctx.send(f"{user.display_name} is currently reading:", embed=embed)
-            else:
-                await ctx.send(f"{user.display_name} has not set a currently reading book.")
-            return
+    choice = {"index": None}
 
-        books = search_google_books(arg)
-        if not books:
-            await ctx.send(f"Could not find any books matching '{arg}'.")
-            return
+    async def select_callback(interact):
+        choice["index"] = int(select.values[0])
+        await interact.response.edit_message(content=f"Selected: {books[choice['index']]['title']} by {books[choice['index']]['authors']}", view=None)
+        view.stop()
 
-        description_lines = []
-        for i, book in enumerate(books, start=1):
-            line = f"**{i}.** [{book['title']}]({book['infoLink']}) by {book['authors']}"
-            description_lines.append(line)
-        description = "\n".join(description_lines)
-        prompt = await ctx.send(
-            f"{ctx.author.mention}, pick the number of the book you want to set as currently reading (1-{len(books)}), or type `cancel`:\n{description}",
-            suppress_embeds=True
-        )
+    select = discord.ui.Select(placeholder="Pick a book...", options=options[:25])
+    select.callback = select_callback
+    view.add_item(select)
 
-        choice = await prompt_for_choice(ctx, prompt, len(books))
-        if choice is None:
-            return
+    await interaction.response.send_message("Select your book:", view=view, ephemeral=True)
+    await view.wait()
+    return choice["index"]
 
-        selected = books[choice]
-        currently_reading[ctx.author.id] = selected
+class RatingView(discord.ui.View):
+    def __init__(self, interaction, book):
+        super().__init__(timeout=60)
+        self.interaction = interaction
+        self.book = book
+        self.rating = None
+        self.value = None
+
+    async def send_review_modal(self, interaction, rating):
+        modal = ReviewModal(book=self.book, rating=rating)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.red)
+    async def one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rating = 1
+        await self.send_review_modal(interaction, 1)
+        self.stop()
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.red)
+    async def two(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rating = 2
+        await self.send_review_modal(interaction, 2)
+        self.stop()
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.grey)
+    async def three(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rating = 3
+        await self.send_review_modal(interaction, 3)
+        self.stop()
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.green)
+    async def four(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rating = 4
+        await self.send_review_modal(interaction, 4)
+        self.stop()
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.green)
+    async def five(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rating = 5
+        await self.send_review_modal(interaction, 5)
+        self.stop()
+
+class ReviewModal(discord.ui.Modal, title="Write your review"):
+    def __init__(self, book, rating):
+        super().__init__()
+        self.book = book
+        self.rating = rating
+        self.review = discord.ui.TextInput(label="Your review (optional)", style=discord.TextStyle.paragraph, required=False, max_length=1024)
+        self.add_item(self.review)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        review_text = self.review.value or None
+        user_reviews = reviews.get(interaction.user.id, [])
+        user_reviews.append({
+            "title": self.book["title"],
+            "authors": self.book["authors"],
+            "description": self.book["description"],
+            "thumbnail": self.book["thumbnail"],
+            "infoLink": self.book["infoLink"],
+            "rating": self.rating,
+            "review_text": review_text,
+        })
+        reviews[interaction.user.id] = user_reviews
 
         embed = discord.Embed(
-            title=selected["title"],
-            url=selected.get("infoLink"),
-            description=selected["description"][:2048],
-            color=discord.Color.blue()
+            title=self.book["title"],
+            url=self.book["infoLink"],
+            description=self.book["description"][:2048],
+            color=discord.Color.purple()
         )
-        embed.set_author(name=selected["authors"])
-        if selected.get("thumbnail"):
-            embed.set_thumbnail(url=selected["thumbnail"])
-        await ctx.send(f"{ctx.author.display_name} is now reading:", embed=embed)
+        embed.add_field(name="Author(s)", value=self.book["authors"], inline=True)
+        embed.add_field(name="Rating", value=f"{self.rating}/5", inline=True)
+        if review_text:
+            embed.add_field(name="Review", value=review_text, inline=False)
+        if self.book["thumbnail"]:
+            embed.set_thumbnail(url=self.book["thumbnail"])
 
-@bot.command(name='clearreading')
-async def clear_reading_command(ctx):
-    if ctx.author.id in currently_reading:
-        del currently_reading[ctx.author.id]
-        await ctx.send("Your currently reading book has been cleared.")
-    else:
-        await ctx.send("You don't have a currently reading book set.")
+        await interaction.response.send_message(f"{interaction.user.display_name} submitted a review!", embed=embed)
 
-@bot.command(name='review')
-async def review_command(ctx, *, arg=None):
-    if not arg:
-        await ctx.send("Usage: `!review Book Title`")
-        return
-
-    books = search_google_books(arg)
+@tree.command(name="review", description="Review a book")
+@app_commands.describe(title="The title of the book you want to review")
+async def review(interaction: discord.Interaction, title: str):
+    books = search_google_books(title)
     if not books:
-        await ctx.send(f"No results found for '{arg}'.")
+        await interaction.response.send_message("No results found.", ephemeral=True)
         return
 
-    lines = []
-    for i, b in enumerate(books, 1):
-        lines.append(f"**{i}.** [{b['title']}]({b['infoLink']}) by {b['authors']}")
-    await ctx.send(
-        f"{ctx.author.mention}, pick a number to review (1-{len(books)}) or type `cancel`:\n" + "\n".join(lines),
-        suppress_embeds=True
-    )
-
-    choice = await prompt_for_choice(ctx, ctx.message, len(books))
+    choice = await prompt_user_choice(interaction, books)
     if choice is None:
         return
 
     selected = books[choice]
+    view = RatingView(interaction, selected)
+    await interaction.followup.send("Select a rating from 1–5:", view=view, ephemeral=True)
 
-    await ctx.send(f"{ctx.author.mention}, enter a rating from 1–5:")
-
-    def check_rating(m): return m.author == ctx.author and m.channel == ctx.channel
-
-    try:
-        msg = await bot.wait_for("message", timeout=60, check=check_rating)
-        rating = int(msg.content)
-        if rating < 1 or rating > 5:
-            raise ValueError
-    except:
-        await ctx.send("Invalid rating or timeout. Review cancelled.")
+@tree.command(name="reading", description="Show or set your currently reading book")
+@app_commands.describe(title="The title of the book you are reading (or leave blank to show)")
+async def reading(interaction: discord.Interaction, title: str = None):
+    user_id = interaction.user.id
+    if title is None:
+        book = currently_reading.get(user_id)
+        if not book:
+            await interaction.response.send_message("No book set. Use `/reading [title]` to set one.", ephemeral=True)
+            return
+        embed = discord.Embed(title=book["title"], url=book["infoLink"], description=book["description"][:2048], color=discord.Color.blue())
+        embed.set_author(name=book["authors"])
+        if book["thumbnail"]:
+            embed.set_thumbnail(url=book["thumbnail"])
+        await interaction.response.send_message(f"{interaction.user.display_name} is currently reading:", embed=embed)
         return
 
-    await ctx.send("Add a text review? Type it now or `skip` to skip.")
+    books = search_google_books(title)
+    if not books:
+        await interaction.response.send_message("No books found.", ephemeral=True)
+        return
 
-    try:
-        msg = await bot.wait_for("message", timeout=90, check=check_rating)
-        review_text = None if msg.content.lower() == "skip" else msg.content
-    except:
-        review_text = None
+    choice = await prompt_user_choice(interaction, books)
+    if choice is None:
+        return
 
-    user_reviews = reviews.get(ctx.author.id, [])
-    user_reviews.append({
-        "title": selected["title"],
-        "authors": selected["authors"],
-        "description": selected["description"],
-        "thumbnail": selected["thumbnail"],
-        "infoLink": selected["infoLink"],
-        "rating": rating,
-        "review_text": review_text,
-    })
-    reviews[ctx.author.id] = user_reviews
+    selected = books[choice]
+    currently_reading[user_id] = selected
 
-    embed = discord.Embed(
-        title=f"Review Submitted: {selected['title']}",
-        url=selected["infoLink"],
-        description=selected["description"][:2048],
-        color=discord.Color.purple()
-    )
-    embed.add_field(name="Author(s)", value=selected["authors"], inline=True)
-    embed.add_field(name="Rating", value=f"{rating}/5", inline=True)
-    if review_text:
-        embed.add_field(name="Review", value=review_text, inline=False)
-    if selected.get("thumbnail"):
+    embed = discord.Embed(title=selected["title"], url=selected["infoLink"], description=selected["description"][:2048], color=discord.Color.blue())
+    embed.set_author(name=selected["authors"])
+    if selected["thumbnail"]:
         embed.set_thumbnail(url=selected["thumbnail"])
-    await ctx.send(embed=embed)
+    await interaction.followup.send(f"{interaction.user.display_name} is now reading:", embed=embed)
 
-@bot.command(name='myreviews')
-async def my_reviews_command(ctx):
-    user_reviews = reviews.get(ctx.author.id, [])
+@tree.command(name="clearreading", description="Clear your currently reading book")
+async def clearreading(interaction: discord.Interaction):
+    if interaction.user.id in currently_reading:
+        del currently_reading[interaction.user.id]
+        await interaction.response.send_message("Cleared your currently reading book.")
+    else:
+        await interaction.response.send_message("You don't have one set.", ephemeral=True)
+
+@tree.command(name="myreviews", description="Show your submitted book reviews")
+async def myreviews(interaction: discord.Interaction):
+    user_reviews = reviews.get(interaction.user.id, [])
     if not user_reviews:
-        await ctx.send("You haven’t submitted any reviews yet.")
+        await interaction.response.send_message("You haven’t submitted any reviews.", ephemeral=True)
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(
-            title=r["title"],
-            url=r["infoLink"],
-            description=r["description"][:2048],
-            color=discord.Color.orange()
-        )
+        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=r["description"][:2048], color=discord.Color.orange())
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
             embed.add_field(name="Review", value=r["review_text"], inline=False)
-        if r.get("thumbnail"):
+        if r["thumbnail"]:
             embed.set_thumbnail(url=r["thumbnail"])
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
 
-@bot.command(name='reviews')
-async def all_reviews_command(ctx, user: discord.User = None):
+@tree.command(name="reviews", description="Show another user's reviews")
+@app_commands.describe(user="User to look up")
+async def reviews_of_user(interaction: discord.Interaction, user: discord.User = None):
     if user is None:
-        user = ctx.author
+        user = interaction.user
     user_reviews = reviews.get(user.id, [])
     if not user_reviews:
-        await ctx.send(f"{user.display_name} has not submitted any reviews yet.")
+        await interaction.response.send_message(f"{user.display_name} has not submitted any reviews.")
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(
-            title=r["title"],
-            url=r["infoLink"],
-            description=r["description"][:2048],
-            color=discord.Color.teal()
-        )
+        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=r["description"][:2048], color=discord.Color.teal())
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
             embed.add_field(name="Review", value=r["review_text"], inline=False)
-        if r.get("thumbnail"):
+        if r["thumbnail"]:
             embed.set_thumbnail(url=r["thumbnail"])
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
 
-@bot.command(name='bookhelp')
-async def book_help(ctx):
-    await ctx.send("""\
-**Book Bot Commands**
-`!reading` – Show your current book  
-`!reading [title]` – Set book  
-`!reading @user` – See someone else's book  
-`!clearreading` – Clear it  
-`!review [title]` – Review a book  
-`!myreviews` – Show your reviews  
-`!reviews @user` – See others' reviews  
-""")
+@tree.command(name="bookhelp", description="List available book bot commands")
+async def bookhelp(interaction: discord.Interaction):
+    await interaction.response.send_message("""\
+**Book Bot Slash Commands**
+/reading [title] – Set or show your book  
+/clearreading – Clear your book  
+/review [title] – Review a book  
+/myreviews – Show your reviews  
+/reviews [user] – See others' reviews  
+""", ephemeral=True)
 
-# --- Flask web server for uptime (optional, remove if not using uptime robot) ---
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-keep_alive()
-# ------------------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"Logged in as {bot.user}")
 
 bot.run(os.getenv("DISCORD_BOT_TOKEN"))
