@@ -3,6 +3,8 @@ from discord.ext import commands
 import requests
 import os
 import asyncio
+from flask import Flask
+from threading import Thread
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -247,7 +249,7 @@ async def all_reviews_command(ctx, user: discord.User = None):
 
 @bot.command(name='bookhelp')
 async def book_help(ctx):
-    await ctx.send("""
+    await ctx.send("""\
 **Book Bot Commands**
 `!reading` – Show your current book  
 `!reading [title]` – Set book  
@@ -257,5 +259,22 @@ async def book_help(ctx):
 `!myreviews` – Show your reviews  
 `!reviews @user` – See others' reviews  
 """)
+
+# --- Flask web server for uptime (optional, remove if not using uptime robot) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+keep_alive()
+# ------------------------------------------------------------------------------
 
 bot.run(os.getenv("DISCORD_BOT_TOKEN"))
