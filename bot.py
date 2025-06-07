@@ -13,6 +13,15 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 currently_reading = {}
 reviews = {}
 
+def truncate_description(desc, link, limit=250):
+    if desc is None:
+        return "No description available."
+    if len(desc) > limit:
+        # Escape parentheses in link for markdown safety
+        safe_link = link.replace("(", "%28").replace(")", "%29")
+        return desc[:limit].rstrip() + f"... [Read more]({safe_link})"
+    return desc
+
 def search_google_books(query, max_results=3):
     url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={max_results}&key={GOOGLE_API_KEY}"
     response = requests.get(url)
@@ -122,7 +131,7 @@ class ReviewModal(discord.ui.Modal, title="Write your review"):
         embed = discord.Embed(
             title=self.book["title"],
             url=self.book["infoLink"],
-            description=self.book["description"][:2048],
+            description=truncate_description(self.book["description"], self.book["infoLink"]),
             color=discord.Color.purple()
         )
         embed.add_field(name="Author(s)", value=self.book["authors"], inline=True)
@@ -157,9 +166,14 @@ async def reading(interaction: discord.Interaction, title: str = None):
     if title is None:
         book = currently_reading.get(user_id)
         if not book:
-            await interaction.response.send_message("No book set. Use `/reading [title]` to set one.", ephemeral=True)
+            await interaction.response.send_message("No book set. Use /reading [title] to set one.", ephemeral=True)
             return
-        embed = discord.Embed(title=book["title"], url=book["infoLink"], description=book["description"][:2048], color=discord.Color.blue())
+        embed = discord.Embed(
+            title=book["title"],
+            url=book["infoLink"],
+            description=truncate_description(book["description"], book["infoLink"]),
+            color=discord.Color.blue()
+        )
         embed.set_author(name=book["authors"])
         if book["thumbnail"]:
             embed.set_thumbnail(url=book["thumbnail"])
@@ -178,7 +192,12 @@ async def reading(interaction: discord.Interaction, title: str = None):
     selected = books[choice]
     currently_reading[user_id] = selected
 
-    embed = discord.Embed(title=selected["title"], url=selected["infoLink"], description=selected["description"][:2048], color=discord.Color.blue())
+    embed = discord.Embed(
+        title=selected["title"],
+        url=selected["infoLink"],
+        description=truncate_description(selected["description"], selected["infoLink"]),
+        color=discord.Color.blue()
+    )
     embed.set_author(name=selected["authors"])
     if selected["thumbnail"]:
         embed.set_thumbnail(url=selected["thumbnail"])
@@ -199,7 +218,12 @@ async def myreviews(interaction: discord.Interaction):
         await interaction.response.send_message("You haven’t submitted any reviews.", ephemeral=True)
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=r["description"][:2048], color=discord.Color.orange())
+        embed = discord.Embed(
+            title=r["title"],
+            url=r["infoLink"],
+            description=truncate_description(r["description"], r["infoLink"]),
+            color=discord.Color.orange()
+        )
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
@@ -218,7 +242,12 @@ async def reviews_of_user(interaction: discord.Interaction, user: discord.User =
         await interaction.response.send_message(f"{user.display_name} has not submitted any reviews.")
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=r["description"][:2048], color=discord.Color.teal())
+        embed = discord.Embed(
+            title=r["title"],
+            url=r["infoLink"],
+            description=truncate_description(r["description"], r["infoLink"]),
+            color=discord.Color.teal()
+        )
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
