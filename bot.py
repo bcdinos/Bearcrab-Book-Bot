@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import requests
 import os
+import re
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -13,34 +14,76 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 currently_reading = {}
 reviews = {}
 
-def truncate_description(desc, link, limit=250):
-    if desc is None:
-        return "No description available."
-    if len(desc) > limit:
-        # Escape parentheses in link for markdown safety
-        safe_link = link.replace("(", "%28").replace(")", "%29")
-        return desc[:limit].rstrip() + f"... [Read more]({safe_link})"
-    return desc
+def normalize_text(text):
+    """Lowercase, remove punctuation and excess whitespace for matching."""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-def search_google_books(query, max_results=3):
-    url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={max_results}&key={GOOGLE_API_KEY}"
+def search_google_books(query, max_results=10):
+    """
+    Enhanced search: accepts a string like 'Title by Author' and tries
+    to find the best matching book by scoring the results.
+    """
+    url = f"https://www.googleapis.com/books/v1/volumes?q={requests.utils.quote(query)}&maxResults={max_results}&key={GOOGLE_API_KEY}"
     response = requests.get(url)
     if response.status_code != 200:
         return None
     data = response.json()
     if "items" not in data or len(data["items"]) == 0:
         return None
+
+    # Parse query for title and author (if " by " present)
+    if " by " in query.lower():
+        parts = query.lower().split(" by ", 1)
+        query_title = normalize_text(parts[0])
+        query_author = normalize_text(parts[1])
+    else:
+        query_title = normalize_text(query)
+        query_author = ""
+
     books = []
+    scored_books = []
+
     for item in data["items"]:
         v = item["volumeInfo"]
+        title = v.get("title", "Unknown Title")
+        authors = v.get("authors", ["Unknown Author"])
+        authors_joined = ", ".join(authors)
+        norm_title = normalize_text(title)
+        norm_authors = normalize_text(authors_joined)
+
+        # Simple scoring: +1 for title substring match, +1 for author substring match
+        score = 0
+        if query_title in norm_title or norm_title in query_title:
+            score += 2
+        if query_author and (query_author in norm_authors or norm_authors in query_author):
+            score += 2
+
         books.append({
-            "title": v.get("title", "Unknown Title"),
-            "authors": ", ".join(v.get("authors", ["Unknown Author"])),
+            "title": title,
+            "authors": authors_joined,
             "description": v.get("description", "No description available."),
             "thumbnail": v.get("imageLinks", {}).get("thumbnail"),
             "infoLink": v.get("infoLink", None),
         })
-    return books
+        scored_books.append((score, books[-1]))
+
+    # Sort by score descending
+    scored_books.sort(key=lambda x: x[0], reverse=True)
+
+    # Return only books, ordered by best match
+    return [book for score, book in scored_books]
+
+def truncate_description(description, info_link, limit=250):
+    if len(description) <= limit:
+        return description
+    else:
+        truncated = description[:limit].rstrip()
+        return f"{truncated}... [Read more]({info_link})"
 
 async def prompt_user_choice(interaction, books):
     view = discord.ui.View(timeout=60)
@@ -70,7 +113,6 @@ class RatingView(discord.ui.View):
         self.interaction = interaction
         self.book = book
         self.rating = None
-        self.value = None
 
     async def send_review_modal(self, interaction, rating):
         modal = ReviewModal(book=self.book, rating=rating)
@@ -168,12 +210,7 @@ async def reading(interaction: discord.Interaction, title: str = None):
         if not book:
             await interaction.response.send_message("No book set. Use /reading [title] to set one.", ephemeral=True)
             return
-        embed = discord.Embed(
-            title=book["title"],
-            url=book["infoLink"],
-            description=truncate_description(book["description"], book["infoLink"]),
-            color=discord.Color.blue()
-        )
+        embed = discord.Embed(title=book["title"], url=book["infoLink"], description=truncate_description(book["description"], book["infoLink"]), color=discord.Color.blue())
         embed.set_author(name=book["authors"])
         if book["thumbnail"]:
             embed.set_thumbnail(url=book["thumbnail"])
@@ -192,12 +229,7 @@ async def reading(interaction: discord.Interaction, title: str = None):
     selected = books[choice]
     currently_reading[user_id] = selected
 
-    embed = discord.Embed(
-        title=selected["title"],
-        url=selected["infoLink"],
-        description=truncate_description(selected["description"], selected["infoLink"]),
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title=selected["title"], url=selected["infoLink"], description=truncate_description(selected["description"], selected["infoLink"]), color=discord.Color.blue())
     embed.set_author(name=selected["authors"])
     if selected["thumbnail"]:
         embed.set_thumbnail(url=selected["thumbnail"])
@@ -218,12 +250,7 @@ async def myreviews(interaction: discord.Interaction):
         await interaction.response.send_message("You haven’t submitted any reviews.", ephemeral=True)
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(
-            title=r["title"],
-            url=r["infoLink"],
-            description=truncate_description(r["description"], r["infoLink"]),
-            color=discord.Color.orange()
-        )
+        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=truncate_description(r["description"], r["infoLink"]), color=discord.Color.orange())
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
@@ -242,12 +269,7 @@ async def reviews_of_user(interaction: discord.Interaction, user: discord.User =
         await interaction.response.send_message(f"{user.display_name} has not submitted any reviews.")
         return
     for r in user_reviews[-5:]:
-        embed = discord.Embed(
-            title=r["title"],
-            url=r["infoLink"],
-            description=truncate_description(r["description"], r["infoLink"]),
-            color=discord.Color.teal()
-        )
+        embed = discord.Embed(title=r["title"], url=r["infoLink"], description=truncate_description(r["description"], r["infoLink"]), color=discord.Color.teal())
         embed.add_field(name="Author(s)", value=r["authors"], inline=True)
         embed.add_field(name="Rating", value=f"{r['rating']}/5", inline=True)
         if r["review_text"]:
